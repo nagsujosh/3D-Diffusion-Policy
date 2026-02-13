@@ -357,13 +357,129 @@ class SimpleDP3(BasePolicy):
 
         loss = F.mse_loss(pred, target, reduction='none')
         loss = loss * loss_mask.type(loss.dtype)
-        loss = reduce(loss, 'b ... -> b (...)', 'mean')
-        loss = loss.mean()
         
-
+        # Compute per-sample and per-dimension losses for detailed logging
+        loss_per_sample = reduce(loss, 'b ... -> b (...)', 'mean')
+        loss_mean = loss_per_sample.mean()
+        
+        # Calculate additional metrics for detailed logging
+        loss_std = loss_per_sample.std()
+        loss_max = loss_per_sample.max()
+        loss_min = loss_per_sample.min()
+        
+        # Compute action-specific losses
+        action_dim = self.action_dim
+        
+        # Extract action loss (pred and target contain full trajectory including obs features if not using global cond)
+        if self.obs_as_global_cond:
+            # When using global conditioning, trajectory is just actions
+            action_pred = pred
+            action_target = target
+            action_loss_mask = loss_mask
+        else:
+            # When not using global conditioning, need to extract action portion
+            action_pred = pred[:, :, :action_dim]
+            action_target = target[:, :, :action_dim]
+            action_loss_mask = loss_mask[:, :, :action_dim]
+        
+        # Compute MSE for action components
+        action_mse = F.mse_loss(action_pred, action_target, reduction='none')
+        action_mse = action_mse * action_loss_mask.type(action_mse.dtype)
+        
+        # Normalize by number of unmasked elements
+        num_unmasked = action_loss_mask.sum()
+        if num_unmasked > 0:
+            action_mse_mean = action_mse.sum() / num_unmasked
+        else:
+            action_mse_mean = action_mse.sum()
+        
+        # Component-wise losses (assuming standard 7-DOF robot action format)
         loss_dict = {
-                'bc_loss': loss.item(),
-            }
+            'bc_loss': loss_mean.item(),
+            'loss_std': loss_std.item(),
+            'loss_max': loss_max.item(),
+            'loss_min': loss_min.item(),
+            'action_mse': action_mse_mean.item(),
+        }
+        
+        # Add component-specific losses if action_dim matches expected format
+        if action_dim == 7:  # Standard 7-DOF format
+            # Position loss (first 3 dims)
+            pos_mse = action_mse[:, :, :3]
+            pos_mask = action_loss_mask[:, :, :3]
+            num_pos_unmasked = pos_mask.sum()
+            if num_pos_unmasked > 0:
+                pos_mse_mean = pos_mse.sum() / num_pos_unmasked
+            else:
+                pos_mse_mean = pos_mse.sum()
+            loss_dict['action_pos_mse'] = pos_mse_mean.item()
+            
+            # Rotation loss (next 3 dims)
+            rot_mse = action_mse[:, :, 3:6]
+            rot_mask = action_loss_mask[:, :, 3:6]
+            num_rot_unmasked = rot_mask.sum()
+            if num_rot_unmasked > 0:
+                rot_mse_mean = rot_mse.sum() / num_rot_unmasked
+            else:
+                rot_mse_mean = rot_mse.sum()
+            loss_dict['action_rot_mse'] = rot_mse_mean.item()
+            
+            # Gripper loss (last dim)
+            gripper_mse = action_mse[:, :, 6:7]
+            gripper_mask = action_loss_mask[:, :, 6:7]
+            num_gripper_unmasked = gripper_mask.sum()
+            if num_gripper_unmasked > 0:
+                gripper_mse_mean = gripper_mse.sum() / num_gripper_unmasked
+            else:
+                gripper_mse_mean = gripper_mse.sum()
+            loss_dict['action_gripper_mse'] = gripper_mse_mean.item()
+            
+        elif action_dim > 7:  # Multi-hand or extended format
+            # Try to parse multiple action groups
+            num_hands = action_dim // 7
+            if num_hands * 7 == action_dim:
+                for hand_idx in range(num_hands):
+                    start_idx = hand_idx * 7
+                    end_idx = start_idx + 7
+                    
+                    hand_mse = action_mse[:, :, start_idx:end_idx]
+                    hand_mask = action_loss_mask[:, :, start_idx:end_idx]
+                    num_hand_unmasked = hand_mask.sum()
+                    if num_hand_unmasked > 0:
+                        hand_mse_mean = hand_mse.sum() / num_hand_unmasked
+                    else:
+                        hand_mse_mean = hand_mse.sum()
+                    loss_dict[f'action_hand{hand_idx}_mse'] = hand_mse_mean.item()
+                    
+                    # Position for this hand
+                    pos_mse = action_mse[:, :, start_idx:start_idx+3]
+                    pos_mask = action_loss_mask[:, :, start_idx:start_idx+3]
+                    num_pos_unmasked = pos_mask.sum()
+                    if num_pos_unmasked > 0:
+                        pos_mse_mean = pos_mse.sum() / num_pos_unmasked
+                    else:
+                        pos_mse_mean = pos_mse.sum()
+                    loss_dict[f'action_hand{hand_idx}_pos_mse'] = pos_mse_mean.item()
+                    
+                    # Rotation for this hand
+                    rot_mse = action_mse[:, :, start_idx+3:start_idx+6]
+                    rot_mask = action_loss_mask[:, :, start_idx+3:start_idx+6]
+                    num_rot_unmasked = rot_mask.sum()
+                    if num_rot_unmasked > 0:
+                        rot_mse_mean = rot_mse.sum() / num_rot_unmasked
+                    else:
+                        rot_mse_mean = rot_mse.sum()
+                    loss_dict[f'action_hand{hand_idx}_rot_mse'] = rot_mse_mean.item()
+                    
+                    # Gripper for this hand
+                    gripper_mse = action_mse[:, :, start_idx+6:start_idx+7]
+                    gripper_mask = action_loss_mask[:, :, start_idx+6:start_idx+7]
+                    num_gripper_unmasked = gripper_mask.sum()
+                    if num_gripper_unmasked > 0:
+                        gripper_mse_mean = gripper_mse.sum() / num_gripper_unmasked
+                    else:
+                        gripper_mse_mean = gripper_mse.sum()
+                    loss_dict[f'action_hand{hand_idx}_gripper_mse'] = gripper_mse_mean.item()
 
         # print(f"t2-t1: {t2-t1:.3f}")
         # print(f"t3-t2: {t3-t2:.3f}")
@@ -371,5 +487,5 @@ class SimpleDP3(BasePolicy):
         # print(f"t5-t4: {t5-t4:.3f}")
         # print(f"t6-t5: {t6-t5:.3f}")
         
-        return loss, loss_dict
+        return loss_mean, loss_dict
 

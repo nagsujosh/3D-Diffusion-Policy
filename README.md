@@ -2,6 +2,26 @@
 
 # <a href="https://3d-diffusion-policy.github.io">3D Diffusion Policy</a>
 
+**Fork by [nagsujosh](https://github.com/nagsujosh)** - Enhanced for dual-camera Franka robot setup
+
+## Improvements in This Fork
+
+**Fixed critical dual-camera bug**: DP3Encoder now correctly passes tensors to PointNet (was passing dict)
+
+**Component-wise loss tracking**: Monitor position, rotation, and gripper errors separately during training
+
+**Simplified checkpoint saving**: Fixed pickling errors, more reliable checkpoint management
+
+**Resume training support**: Automatically resumes from latest.ckpt with `resume: True`
+
+**Dual-camera verification**: Added setup validation script for dual-view point clouds
+
+**Enhanced documentation**: Consolidated training guide with troubleshooting
+
+Original repository: [YanjieZe/3D-Diffusion-Policy](https://github.com/YanjieZe/3D-Diffusion-Policy)
+
+---
+
 <a href="https://3d-diffusion-policy.github.io"><strong>Project Page</strong></a>
   |
   <a href="https://arxiv.org/abs/2403.03954"><strong>arXiv</strong></a>
@@ -35,7 +55,14 @@
 **Applications and extensions of DP3 from the community**:
 - [arXiv 2025.10](https://lei-kun.github.io/RL-100/), *RL-100: Performant Robotic Manipulation with Real-World Reinforcement Learning*, where DP3 shows 100% manipulation success rate after offline RL and online RL finetuning.
 - [arXiv 2025.09](https://arxiv.org/abs/2509.01819), *ManiFlow: A General Robot Manipulation Policy via Consistency Flow Training*, where DP3 is improved via new backbones and flow matching objective.
-- [arXiv 2025.07](https://arxiv.org/abs/2507.00833), *HumanoidGen: Data Generation for Bimanual Dexterous Manipulation via LLM Reasoning*, where DP3 shows superior performance over DP on bimanual humanoid manipulation tasks in simulation.
+- [arXiv 2025.07](https://arxiv.org/abs/2507.00833), *HumanoidGen: Data Generation for Bimanual Dexterous Manipulation via LLM Reasoning*, where DP3 shows superior performance over DP on bimanual human
+
+
+\o
+
+
+
+id manipulation tasks in simulation.
 - [arXiv 2025.06](https://arxiv.org/abs/2506.15666), *Vision in Action: Learning Active Perception from Human Demonstrations*, where DP3 serves as a strong baseline in active perception tasks.
 - [arXiv 2025.06](https://arxiv.org/abs/2506.14317), *ClutterDexGrasp: A Sim-to-Real System for General Dexterous Grasping in Cluttered Scenes*, where DP3 shows impressive dex grasping capbilities by distilling an RL teacher policy.
 - [arXiv 2025.05](https://arxiv.org/abs/2505.07819), *H3DP: Triply-Hierarchical Diffusion Policy for Visuomotor Learning*, where DP3 shows significantly better results over DP and DP w/ depth.
