@@ -1,0 +1,30 @@
+name: stacking_cups
+
+task_name: stacking_cups
+
+shape_meta: &shape_meta
+  # acceptable types: rgb, low_dim, point_cloud
+  obs:
+    agentview_point_cloud:
+      shape: [8192, 6]  # xyz + rgb
+      type: point_cloud
+    eye_in_hand_point_cloud:
+      shape: [8192, 6]  # xyz + rgb
+      type: point_cloud
+    agent_pos:
+      shape: [21] 
+      type: low_dim
+  action:
+    shape: [7]  # Franka 7-DOF action
+
+env_runner: null
+
+dataset:
+  _target_: diffusion_policy_3d.dataset.franka_dataset.FrankaDataset
+  zarr_path: ../data/stacking_cups_dual_view.zarr
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.05
+  max_train_episodes: null
