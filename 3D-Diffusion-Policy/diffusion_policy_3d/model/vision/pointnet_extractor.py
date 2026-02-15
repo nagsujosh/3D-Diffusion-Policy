@@ -202,49 +202,62 @@ class PointNetEncoderXYZ(nn.Module):
 
 
 class DP3Encoder(nn.Module):
-    def __init__(self, observation_space, img_crop_shape=None, out_channel=256, 
+    def __init__(self, observation_space, img_crop_shape=None, out_channel=256,
              pointcloud_encoder_cfg=None, use_pc_color=False, pointnet_type="pointnet"):
         super().__init__()
         self.use_pc_color = use_pc_color
         self.pointnet_type = pointnet_type
-        
+
+        # Detect low-dim observations (e.g. agent_pos)
+        # Note: Hydra/OmegaConf produces ListConfig, not plain list/tuple
+        self.low_dim_keys = []
+        self.low_dim_total_dim = 0
+        for key, shape in observation_space.items():
+            if not isinstance(shape, str) and hasattr(shape, '__len__') and len(shape) == 1:
+                # 1D observation = low-dim (e.g. agent_pos with shape [21])
+                self.low_dim_keys.append(key)
+                self.low_dim_total_dim += shape[0]
+
+        if self.low_dim_keys:
+            cprint(f"[DP3Encoder] Low-dim keys: {self.low_dim_keys} (total dim={self.low_dim_total_dim})", "cyan")
+
         # Detect dual pointcloud setup
         has_agentview = "agentview_point_cloud" in observation_space
         has_eye_in_hand = "eye_in_hand_point_cloud" in observation_space
         has_single = "point_cloud" in observation_space
-        
+
         if has_agentview and has_eye_in_hand:
             # Dual camera setup
             self.use_dual_pointclouds = True
             self.point_cloud_key = None  # Not used in dual mode
-            
+
             agentview_shape = observation_space["agentview_point_cloud"]
             eye_in_hand_shape = observation_space["eye_in_hand_point_cloud"]
-            
+
             # Verify both have same feature dimension (should be 6: xyz+rgb or 3: xyz)
             assert agentview_shape[-1] == eye_in_hand_shape[-1], \
                 f"Point cloud feature dims must match: {agentview_shape} vs {eye_in_hand_shape}"
-            
+
             # Combined point cloud will have N1+N2 points
             num_points_agentview = agentview_shape[0]
             num_points_eye = eye_in_hand_shape[0]
             num_points_total = num_points_agentview + num_points_eye
             feature_dim = agentview_shape[-1]
-            
+
             self.point_cloud_shape = [num_points_total, feature_dim]
-            
+
             print(f"[DP3Encoder] Dual-camera mode: agentview({num_points_agentview}) + "
                   f"eye_in_hand({num_points_eye}) = {num_points_total} points × {feature_dim} features")
-            
+
         elif has_single:
             # Single camera setup (backward compatibility)
             self.use_dual_pointclouds = False
             self.point_cloud_key = "point_cloud"
             self.point_cloud_shape = observation_space[self.point_cloud_key]
-            
+
             print(f"[DP3Encoder] Single-camera mode: {self.point_cloud_shape[0]} points × "
                   f"{self.point_cloud_shape[-1]} features")
-            
+
         else:
             raise KeyError(
                 f"Invalid observation space configuration. Expected either:\n"
@@ -252,7 +265,7 @@ class DP3Encoder(nn.Module):
                 f"  - Single camera: 'point_cloud'\n"
                 f"Got keys: {list(observation_space.keys())}"
             )
-    
+
         # Build point cloud encoder with the combined/single shape
         self.pointcloud_encoder = self._build_pointcloud_encoder(
             point_cloud_shape=self.point_cloud_shape,
@@ -261,10 +274,12 @@ class DP3Encoder(nn.Module):
             use_pc_color=use_pc_color,
             pointnet_type=pointnet_type,
         )
-        
-        # Set output channel attribute (required by dp3.py)
+
+        # Total output = point cloud features + low-dim features
         self.out_channel = out_channel
-        self.n_output_channels = out_channel
+        self.n_output_channels = out_channel + self.low_dim_total_dim
+
+        cprint(f"[DP3Encoder] Output: pc_features({out_channel}) + low_dim({self.low_dim_total_dim}) = {self.n_output_channels}", "cyan")
 
     def _build_pointcloud_encoder(self, point_cloud_shape, out_channel, pointcloud_encoder_cfg, use_pc_color, pointnet_type):
         if pointnet_type == "pointnet":
@@ -281,8 +296,8 @@ class DP3Encoder(nn.Module):
 
     def forward(self, obs_dict):
         """
-        Process observation dictionary containing point cloud(s) and optional agent position.
-        
+        Process observation dictionary containing point cloud(s) and agent position.
+
         Args:
             obs_dict: Dictionary containing:
                 Dual-camera mode:
@@ -291,50 +306,67 @@ class DP3Encoder(nn.Module):
                 Single-camera mode:
                     - 'point_cloud': (B, N, C) or (B, T, N, C)
                 Both modes:
-                    - 'agent_pos': (B, D) or (B, T, D) [optional]
-        
+                    - 'agent_pos': (B, D) — low-dim proprioceptive state
+
         Returns:
-            features: (B, out_channel) or (B, T, out_channel)
+            features: (B, out_channel + low_dim_dim)
         """
         if self.use_dual_pointclouds:
             # Extract both pointclouds
             agentview_pc = obs_dict['agentview_point_cloud']
             eye_in_hand_pc = obs_dict['eye_in_hand_point_cloud']
-            
+
             # Handle both (B, N, C) and (B, T, N, C) cases
             has_time_dim = agentview_pc.ndim == 4
-            
+
             if has_time_dim:
                 B, T, N1, C = agentview_pc.shape
                 _, _, N2, _ = eye_in_hand_pc.shape
-                
+
                 # Flatten temporal dimension: (B, T, N, C) -> (B*T, N, C)
                 agentview_flat = agentview_pc.reshape(B * T, N1, C)
                 eye_in_hand_flat = eye_in_hand_pc.reshape(B * T, N2, C)
-                
+
                 # Concatenate along point dimension
                 combined_pc = torch.cat([agentview_flat, eye_in_hand_flat], dim=1)  # (B*T, N1+N2, C)
-                
+
                 # Encode - pass tensor directly to PointNet
-                features = self.pointcloud_encoder(combined_pc)  # (B*T, out_channel)
-                
+                pc_features = self.pointcloud_encoder(combined_pc)  # (B*T, out_channel)
+
                 # Reshape back to temporal: (B*T, out_channel) -> (B, T, out_channel)
-                features = features.reshape(B, T, -1)
-                
+                pc_features = pc_features.reshape(B, T, -1)
+
             else:  # No time dimension: (B, N, C)
                 B, N1, C = agentview_pc.shape
                 _, N2, _ = eye_in_hand_pc.shape
-                
+
                 # Concatenate along point dimension
                 combined_pc = torch.cat([agentview_pc, eye_in_hand_pc], dim=1)  # (B, N1+N2, C)
-                
+
                 # Encode - pass tensor directly to PointNet
-                features = self.pointcloud_encoder(combined_pc)  # (B, out_channel)
-    
+                pc_features = self.pointcloud_encoder(combined_pc)  # (B, out_channel)
+
         else:
-            # Single pointcloud mode - pass through directly
-            features = self.pointcloud_encoder(obs_dict)
-        
+            # Single pointcloud mode
+            pc = obs_dict.get(self.point_cloud_key, obs_dict.get('point_cloud'))
+            if isinstance(pc, dict):
+                pc = pc[self.point_cloud_key]
+            pc_features = self.pointcloud_encoder(pc)
+
+        # Concatenate low-dim observations (e.g. agent_pos) with point cloud features
+        if self.low_dim_keys:
+            low_dim_parts = []
+            for key in self.low_dim_keys:
+                if key in obs_dict:
+                    low_dim_parts.append(obs_dict[key])
+            if low_dim_parts:
+                low_dim_cat = torch.cat(low_dim_parts, dim=-1)  # (B, low_dim_total_dim)
+                features = torch.cat([pc_features, low_dim_cat], dim=-1)  # (B, out_channel + low_dim)
+            else:
+                features = pc_features
+        else:
+            features = pc_features
+
         return features
 
     def output_shape(self):

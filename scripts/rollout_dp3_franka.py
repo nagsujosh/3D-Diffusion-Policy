@@ -735,7 +735,7 @@ def rollout_dp3(
     framestack.reset(agentview_pc0, eye_in_hand_pc0, agent_pos0)
 
     if plot:
-        for name in ["AgentView RGB", "AgentView Depth"]:
+        for name in ["AgentView RGB", "AgentView Depth", "Eye-in-Hand RGB", "Eye-in-Hand Depth"]:
             cv2.namedWindow(name, cv2.WINDOW_NORMAL)
 
     prev_sigs = {cid: obs0[cid]["sig"] for cid in camera_ids}
@@ -852,16 +852,28 @@ def rollout_dp3(
 
         # ==================== 5. Visualisation ====================
         if plot:
-            # Show first camera's RGB/depth
+            # Show agentview camera (camera_ids[0])
             cam0 = obs[camera_ids[0]]
             cv2.imshow("AgentView RGB", cam0["rgb"][..., ::-1])
-            d = cam0["depth"]
-            if d.max() > 0:
-                d_vis = (d / d.max() * 255).astype(np.uint8)
+            d0 = cam0["depth"]
+            if d0.max() > 0:
+                d0_vis = (d0 / d0.max() * 255).astype(np.uint8)
                 cv2.imshow(
                     "AgentView Depth",
-                    cv2.applyColorMap(d_vis, cv2.COLORMAP_JET),
+                    cv2.applyColorMap(d0_vis, cv2.COLORMAP_JET),
                 )
+
+            # Show eye-in-hand camera (camera_ids[1]) if available
+            if len(camera_ids) > 1 and camera_ids[1] in obs:
+                cam1 = obs[camera_ids[1]]
+                cv2.imshow("Eye-in-Hand RGB", cam1["rgb"][..., ::-1])
+                d1 = cam1["depth"]
+                if d1.max() > 0:
+                    d1_vis = (d1 / d1.max() * 255).astype(np.uint8)
+                    cv2.imshow(
+                        "Eye-in-Hand Depth",
+                        cv2.applyColorMap(d1_vis, cv2.COLORMAP_JET),
+                    )
 
             key = cv2.waitKey(1)
             if key == ord("p"):
@@ -871,7 +883,17 @@ def rollout_dp3(
                 print("[VIZ] ESC pressed — ending rollout")
                 break
 
-        imgs.append(obs[camera_ids[0]]["rgb"].copy())
+        # Record side-by-side frame from both cameras for video
+        frame_cam0 = obs[camera_ids[0]]["rgb"].copy()
+        if len(camera_ids) > 1 and camera_ids[1] in obs:
+            frame_cam1 = obs[camera_ids[1]]["rgb"].copy()
+            # Resize eye-in-hand to match agentview height if needed
+            if frame_cam0.shape[0] != frame_cam1.shape[0]:
+                frame_cam1 = cv2.resize(frame_cam1, (frame_cam1.shape[1], frame_cam0.shape[0]))
+            combined_frame = np.concatenate([frame_cam0, frame_cam1], axis=1)
+            imgs.append(combined_frame)
+        else:
+            imgs.append(frame_cam0)
 
         if global_step % 20 == 0:
             print(
@@ -915,6 +937,8 @@ def _build_dual_pointclouds(
     eye_in_hand_id = 1
     
     # Build agentview point cloud
+    # NOTE: normalize_rgb=False because the training zarr stores RGB as [0, 255].
+    # The model's normalizer will map [0, 255] -> [-1, 1] at inference time.
     if agentview_id in obs and agentview_id in camera_ids:
         cam = obs[agentview_id]
         agentview_pc = depth_to_pointcloud(
@@ -925,13 +949,13 @@ def _build_dual_pointclouds(
             fy=fy,
             cx=cx,
             cy=cy,
-            normalize_rgb=True,
+            normalize_rgb=False,
         )
     else:
         # If agentview camera not available, return zeros
         agentview_pc = np.zeros((num_points, 6), dtype=np.float32)
         print(f"[WARN] AgentView camera (id={agentview_id}) not found, using zeros")
-    
+
     # Build eye_in_hand point cloud
     if eye_in_hand_id in obs and eye_in_hand_id in camera_ids:
         cam = obs[eye_in_hand_id]
@@ -943,7 +967,7 @@ def _build_dual_pointclouds(
             fy=fy,
             cx=cx,
             cy=cy,
-            normalize_rgb=True,
+            normalize_rgb=False,
         )
     else:
         # If eye_in_hand camera not available, return zeros
