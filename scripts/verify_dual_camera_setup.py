@@ -27,7 +27,7 @@ print("=" * 80)
 # 1. Check Zarr Data Format
 # ============================================================
 print("\n[1/5] Checking Zarr data format...")
-zarr_path = project_root / "data/stacking_cups_dual_view.zarr"
+zarr_path = project_root / "data/screwdriver_dual_view.zarr"
 
 if not zarr_path.exists():
     print(f"[ERROR] Zarr file not found at {zarr_path}")
@@ -57,7 +57,7 @@ action_shape = data_group['action'].shape
 assert agentview_shape[-1] == 6, f"AgentView should be (N, 8192, 6), got {agentview_shape}"
 assert eye_in_hand_shape[-1] == 6, f"Eye-in-hand should be (N, 8192, 6), got {eye_in_hand_shape}"
 assert state_shape[-1] == 21, f"State should be (N, 21), got {state_shape}"
-assert action_shape[-1] == 7, f"Action should be (N, 7), got {action_shape}"
+assert action_shape[-1] == 10, f"Action should be (N, 10), got {action_shape}"
 
 print(f"[OK] All shapes correct!")
 print(f"  Total timesteps: {len(agentview_shape)}")
@@ -88,14 +88,14 @@ try:
     print(f"  obs keys: {list(sample['obs'].keys())}")
     print(f"  agentview_point_cloud: {sample['obs']['agentview_point_cloud'].shape}")
     print(f"  eye_in_hand_point_cloud: {sample['obs']['eye_in_hand_point_cloud'].shape}")
-    print(f"  agent_pos: {sample['obs']['agent_pos'].shape}")
+    print(f"  state: {sample['obs']['state'].shape}")
     print(f"  action: {sample['action'].shape}")
     
     # Verify shapes match config
     assert sample['obs']['agentview_point_cloud'].shape == (4, 8192, 6), "Wrong agentview shape"
     assert sample['obs']['eye_in_hand_point_cloud'].shape == (4, 8192, 6), "Wrong eye_in_hand shape"
-    assert sample['obs']['agent_pos'].shape == (4, 21), "Wrong agent_pos shape"
-    assert sample['action'].shape == (4, 7), "Wrong action shape"
+    assert sample['obs']['state'].shape == (4, 21), "Wrong state shape"
+    assert sample['action'].shape == (4, 10), "Wrong action shape"
     
     print("[OK] Sample shapes correct!")
     
@@ -115,8 +115,8 @@ try:
     from diffusion_policy_3d.policy.dp3 import DP3
     
     # Load config with proper Hydra composition
-    config_path = project_root / "3D-Diffusion-Policy/diffusion_policy_3d/config/train_stacking_cups.yaml"
-    task_config_path = project_root / "3D-Diffusion-Policy/diffusion_policy_3d/config/task/stacking_cups.yaml"
+    config_path = project_root / "3D-Diffusion-Policy/diffusion_policy_3d/config/train_custom.yaml"
+    task_config_path = project_root / "3D-Diffusion-Policy/diffusion_policy_3d/config/task/custom.yaml"
     
     # Load both configs
     cfg = OmegaConf.load(str(config_path))
@@ -199,9 +199,9 @@ try:
         'obs': {
             'agentview_point_cloud': torch.randn(batch_size, 4, 8192, 6).to(device),
             'eye_in_hand_point_cloud': torch.randn(batch_size, 4, 8192, 6).to(device),
-            'agent_pos': torch.randn(batch_size, 4, 21).to(device),
+            'state': torch.randn(batch_size, 4, 21).to(device),
         },
-        'action': torch.randn(batch_size, 4, 7).to(device),
+        'action': torch.randn(batch_size, 4, 10).to(device),
     }
     
     # Set normalizer and move to device
@@ -213,8 +213,38 @@ try:
     
     print("[OK] Normalizer set and moved to device")
     
+    # Debug: Check encoder output dimensions
+    print("\n  Debugging encoder output...")
+    print(f"  n_obs_steps: {policy.n_obs_steps}")
+    print(f"  obs_feature_dim: {policy.obs_feature_dim}")
+    print(f"  Expected global_cond_dim: {policy.obs_feature_dim * policy.n_obs_steps}")
+    
+    # Check what the encoder actually outputs
+    test_obs = {
+        'agentview_point_cloud': dummy_batch['obs']['agentview_point_cloud'][:, :policy.n_obs_steps],
+        'eye_in_hand_point_cloud': dummy_batch['obs']['eye_in_hand_point_cloud'][:, :policy.n_obs_steps],
+        'state': dummy_batch['obs']['state'][:, :policy.n_obs_steps],
+    }
+    
+    # Reshape for encoder
+    test_obs_flat = {
+        'agentview_point_cloud': test_obs['agentview_point_cloud'].reshape(-1, *test_obs['agentview_point_cloud'].shape[2:]),
+        'eye_in_hand_point_cloud': test_obs['eye_in_hand_point_cloud'].reshape(-1, *test_obs['eye_in_hand_point_cloud'].shape[2:]),
+        'state': test_obs['state'].reshape(-1, *test_obs['state'].shape[2:]),
+    }
+    
+    print(f"  test_obs_flat shapes:")
+    print(f"    agentview_point_cloud: {test_obs_flat['agentview_point_cloud'].shape}")
+    print(f"    eye_in_hand_point_cloud: {test_obs_flat['eye_in_hand_point_cloud'].shape}")
+    print(f"    state: {test_obs_flat['state'].shape}")
+    
+    with torch.no_grad():
+        encoder_output = policy.obs_encoder(test_obs_flat)
+    print(f"  Encoder output shape: {encoder_output.shape}")
+    print(f"  Encoder output reshaped to (batch, -1): {encoder_output.reshape(batch_size, -1).shape}")
+    
     # Test compute_loss
-    print("  Testing compute_loss...")
+    print("\n  Testing compute_loss...")
     loss_mean, loss_dict = policy.compute_loss(dummy_batch)
     print(f"[OK] compute_loss works! Loss: {loss_mean.item():.4f}")
     
@@ -230,8 +260,8 @@ try:
     expected_action_steps = min(4, horizon - (n_obs_steps - 1))  # min(4, 4-1) = 3
     assert result['action'].shape[1] == expected_action_steps, \
         f"Action steps mismatch: expected {expected_action_steps}, got {result['action'].shape[1]}"
-    assert result['action'].shape == (batch_size, expected_action_steps, 7), \
-        f"Action shape should be ({batch_size}, {expected_action_steps}, 7), got {result['action'].shape}"
+    assert result['action'].shape == (batch_size, expected_action_steps, 10), \
+        f"Action shape should be ({batch_size}, {expected_action_steps}, 10), got {result['action'].shape}"
     
     print("[OK] Forward pass successful!")
     

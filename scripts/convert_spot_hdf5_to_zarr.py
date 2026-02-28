@@ -100,13 +100,13 @@ class HDF5ToZarrConverter:
         self.img_height = 240
         
         # Default camera intrinsics
-        self.fx = 320.0
-        self.fy = 320.0  
+        self.fx = 276.0
+        self.fy = 276.0 
         self.cx = 160.0
         self.cy = 120.0
         
         # Depth scale factor (convert uint16 depth to meters)
-        self.depth_scale = 0.001
+        self.depth_scale = 0.001  ## Remind yourself to add this in the rollout code
         
     def depth_to_pointcloud(self, rgb_image: np.ndarray, depth_image: np.ndarray) -> np.ndarray:
         """
@@ -177,20 +177,17 @@ class HDF5ToZarrConverter:
             timestep: Current timestep index
             
         Returns:
-            agent_pos: [21] dimensional state vector containing:
+            agent_pos: [20] dimensional state vector containing:
                      - joint_states: [7] joint positions  
                      - ee_position: [3] end-effector XYZ
                      - ee_rotation: [9] end-effector rotation matrix (flattened)
-                     - gripper_states: [2] gripper positions
+                     - gripper_states: [1] gripper positions
         """
         obs = demo_data['obs']
         state_components = []        
         # 1. Joint positions (7 DOF arm)
         if 'joint_states' in obs:
             joint_pos = obs['joint_states'][timestep]  # [7]
-            state_components.append(joint_pos)
-        else:
-            joint_pos = np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785])
             state_components.append(joint_pos)
         
         # 2. End-effector pose (position + rotation)
@@ -215,19 +212,14 @@ class HDF5ToZarrConverter:
         # 3. Gripper state (2 elements for parallel gripper)
         if 'gripper_states' in obs:
             gripper_state = obs['gripper_states'][timestep]
-            if len(gripper_state) == 1:
-                gripper_pos = [gripper_state[0], gripper_state[0]]  # Symmetric gripper
-            else:
-                gripper_pos = gripper_state[:2]
-            state_components.append(np.array(gripper_pos))
+            state_components.append(np.array(gripper_state))
         else:
-            gripper_pos = [0.04, 0.04]  # Default gripper opening
-            state_components.append(np.array(gripper_pos))
+            print("\n\nFuck Bro No Gripper State")
         
         # Combine all components into single state vector
         agent_pos = np.concatenate(state_components).astype(np.float32)
         
-        return agent_pos  # Shape: [21]
+        return agent_pos  # Shape: [20]
     
     def list_available_demos(self) -> List[str]:
         """List all available demonstrations in the HDF5 file."""
@@ -260,7 +252,7 @@ class HDF5ToZarrConverter:
             # Initialize arrays for this demo
             agentview_pointclouds = np.zeros((seq_length, self.max_points, 6), dtype=np.float32)
             eye_in_hand_pointclouds = np.zeros((seq_length, self.max_points, 6), dtype=np.float32)
-            agent_positions = np.zeros((seq_length, 21), dtype=np.float32)
+            agent_positions = np.zeros((seq_length, 20), dtype=np.float32)
             
             # Prepare demo data dict for agent_pos extraction
             demo_data = {'obs': {key: obs_group[key][:] for key in obs_group.keys()}}
@@ -327,14 +319,14 @@ class HDF5ToZarrConverter:
         print(f"\nARRAY SHAPES:")
         print(f"   AgentView Point Cloud: {agentview_pc.shape} -> Total: {(total_timesteps, self.max_points, 6)}")
         print(f"   Eye-in-Hand Point Cloud: {eye_in_hand_pc.shape} -> Total: {(total_timesteps, self.max_points, 6)}")
-        print(f"   Agent Positions (State): {agent_pos.shape} -> Total: {(total_timesteps, 21)}")
+        print(f"   Agent Positions (State): {agent_pos.shape} -> Total: {(total_timesteps, 20)}")
         print(f"   Actions: {actions.shape} -> Total: {(total_timesteps, actions.shape[1])}")
         
         print(f"\nZARR FILE STRUCTURE:")
         print(f"   /data/")
         print(f"   ├── agentview_point_cloud     : shape {(total_timesteps, self.max_points, 6)}, dtype=float32")
         print(f"   ├── eye_in_hand_point_cloud   : shape {(total_timesteps, self.max_points, 6)}, dtype=float32")  
-        print(f"   ├── state                     : shape {(total_timesteps, 21)}, dtype=float32")
+        print(f"   ├── state                     : shape {(total_timesteps, 20)}, dtype=float32")
         print(f"   └── action                    : shape {(total_timesteps, actions.shape[1])}, dtype=float64")
         print(f"   /meta/")
         print(f"   ├── episode_ends              : shape ({num_episodes},), dtype=int")
@@ -346,8 +338,8 @@ class HDF5ToZarrConverter:
         print(f"   - r, g, b: RGB color values [0-255]")
         print(f"   - Points are padded with zeros if fewer than {self.max_points:,} valid points")
         
-        print(f"\nAGENT STATE FORMAT (21 dimensions):")
-        print(f"   [joint_states(7) + ee_position(3) + ee_rotation(9) + gripper_states(2)]")
+        print(f"\nAGENT STATE FORMAT (20 dimensions):")
+        print(f"   [joint_states(7) + ee_position(3) + ee_rotation(9) + gripper_states(1)]")
         print(f"   - joint_states: 7 DOF arm joint positions")
         print(f"   - ee_position: End-effector XYZ position")  
         print(f"   - ee_rotation: End-effector rotation matrix (flattened)")
@@ -373,7 +365,7 @@ class HDF5ToZarrConverter:
         
         print(f"   AgentView Valid Points: {agentview_valid:,} / {self.max_points:,}")
         print(f"   Eye-in-Hand Valid Points: {eye_in_hand_valid:,} / {self.max_points:,}")
-        print(f"   Agent Position Sample: {sample_agent_pos[:5]} ... (showing first 5/21)")
+        print(f"   Agent Position Sample: {sample_agent_pos[:5]} ... (showing first 5/20)")
         print(f"   Action Sample: {sample_action}")
         
         print("=" * 80)
@@ -501,7 +493,7 @@ class HDF5ToZarrConverter:
 def main():
     """Main function to demonstrate zarr conversion."""
     # Configuration
-    hdf5_path = "data/screwdriver/screwdriver.h5"
+    hdf5_path = "data/screwdriver.h5"
     output_path = "data/screwdriver_dual_view.zarr"
     max_points = 8192
     demo_limit = None  # Process ALL demos

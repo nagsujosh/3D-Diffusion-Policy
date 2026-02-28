@@ -4,7 +4,7 @@
 # Usage: bash scripts/custom_training.sh <task_name> <zarr_path> [gpu_id] [seed]
 #
 # Example:
-#   bash scripts/custom_training.sh placing_bell_pepper ../data/placing_bell_pepper_dual_view.zarr 0 42
+#   bash scripts/custom_training.sh placing_bell_pepper ../data/data/bell_papper_placing_dual_view.zarr 0 42
 
 if [ -z "$1" ] || [ -z "$2" ]; then
     echo "Usage: bash scripts/custom_training.sh <task_name> <zarr_path> [gpu_id] [seed]"
