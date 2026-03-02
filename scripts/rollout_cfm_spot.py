@@ -1,32 +1,34 @@
 #!/usr/bin/env python3
 """
-rollout_dp3_spot.py
--------------------
-Roll out a trained DP3 policy on Boston Dynamics Spot using dual-camera
-point-cloud observations.
+    rollout_cfm_spot.py
+    -------------------
+    Roll out a trained FlowPolicy/CFM policy on Boston Dynamics Spot using
+    dual-camera point-cloud observations.
 
-Observation format (matches training data exactly):
-  agentview_point_cloud  : (8192, 6) XYZ + BGR (uint8 range 0-255)
-  eye_in_hand_point_cloud: (8192, 6) XYZ + BGR (uint8 range 0-255)
-  state                  : (20,) float32
-      [ arm_q(7) | ee_pos(3) | ee_rot_flat(9) | gripper(1) ]
+    Observation format (matches training data exactly):
+    agentview_point_cloud  : (8192, 6) XYZ + BGR (uint8 range 0-255)
+    eye_in_hand_point_cloud: (8192, 6) XYZ + BGR (uint8 range 0-255)
+    state                  : (20,) float32
+        [ arm_q(7) | ee_pos(3) | ee_rot_flat(9) | gripper(1) ]
 
-Action format (10-dim):
-  [ Δx Δy Δz (3) | rot6d (6) | gripper_abs (1) ]
+    Action format (10-dim):
+    [ Δx Δy Δz (3) | rot6d (6) | gripper_abs (1) ]
 
-Usage:
-python rollout_dp3_spot.py --ckpt ../data/screwdriver/epoch=0300-train_loss=0.000.ckpt \
-    --use-spot-hand-camera \
-    --control-hz 10 \
-    --show \
-    --use-student-t \
-    --n-samples 3
+    Usage:
+    ### CFM
+    python rollout_cfm_spot.py --ckpt /home/akash/UNH/EFM/FlowPolicy/checkpoints/cfm/epoch=395-train_loss=0.004.ckpt \
+        --use-spot-hand-camera \
+        --control-hz 10 \
+        --show \
+        --use-student-t \
+        --n-samples 3
 
-Safety: keep one hand near the E-stop at all times.
+    Safety: keep one hand near the E-stop at all times.
 """
 from __future__ import annotations
 
 import argparse
+import importlib
 import multiprocessing as mp
 import os
 import queue
@@ -34,6 +36,7 @@ import signal
 import sys
 import threading
 import time
+import types
 from collections import deque
 from multiprocessing import shared_memory
 from typing import Dict, List, Optional, Tuple
@@ -51,16 +54,16 @@ except Exception:
     student_t = None
 
 # ---------------------------------------------------------------------------
-# DP3 package path — works whether installed with pip or not
+# FlowPolicy package path
 # ---------------------------------------------------------------------------
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))   # scripts/
-_DP3_ROOT = os.environ.get(
-    "DP3_ROOT",
-    os.path.normpath(os.path.join(_THIS_DIR, "..", "3D-Diffusion-Policy"))
+_FLOWPOLICY_ROOT = os.environ.get(
+    "FLOWPOLICY_ROOT",
+    "/home/akash/UNH/EFM/FlowPolicy",
 )
-if os.path.isdir(_DP3_ROOT) and _DP3_ROOT not in sys.path:
-    sys.path.insert(0, _DP3_ROOT)
-    print(f"[DP3] Added to sys.path: {_DP3_ROOT}")
+if os.path.isdir(_FLOWPOLICY_ROOT) and _FLOWPOLICY_ROOT not in sys.path:
+    sys.path.insert(0, _FLOWPOLICY_ROOT)
+    print(f"[FlowPolicy] Added to sys.path: {_FLOWPOLICY_ROOT}")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -72,6 +75,8 @@ def _add_to_path(p: str) -> None:
 
 
 def _get_shape_meta(cfg) -> dict:
+    if "shape_meta" in cfg:
+        return OmegaConf.to_container(cfg.shape_meta, resolve=True)
     if "policy" in cfg and "shape_meta" in cfg.policy:
         return OmegaConf.to_container(cfg.policy.shape_meta, resolve=True)
     if "task" in cfg and "shape_meta" in cfg.task:
@@ -94,8 +99,15 @@ def _extract_obs_keys(shape_meta: dict) -> Tuple[List[str], List[str]]:
     obs_meta = shape_meta["obs"]
     pc_keys, lowdim_keys = [], []
     for key, attr in obs_meta.items():
-        obs_type = attr.get("type", "low_dim")
-        if obs_type == "point_cloud":
+        obs_type = attr.get("type", None)
+        shape = tuple(attr.get("shape", ()))
+        # Some FlowPolicy configs do not store explicit type; infer from key/shape.
+        is_point_cloud = (
+            obs_type == "point_cloud"
+            or ("point_cloud" in key)
+            or (len(shape) == 2 and shape[-1] in (3, 6) and shape[0] >= 128)
+        )
+        if is_point_cloud:
             pc_keys.append(key)
         else:
             lowdim_keys.append(key)
@@ -203,6 +215,64 @@ def multi_sample_inference(
     return robust_actions, infer_ms, samples
 
 
+def _import_real_robot_flowpolicy():
+    """
+    Import RealRobotFlowPolicy from FlowPolicy training modules without pulling
+    unrelated local train.py modules that may import wandb/protobuf stacks.
+    """
+    candidates = (
+        "train_real_robot_flowpolicy_dual_view",
+        "train_real_robot_flowpolicy",
+    )
+    last_exc = None
+    for mod_name in candidates:
+        prev_train_mod = sys.modules.get("train", None)
+        shim_train_mod = types.ModuleType("train")
+        shim_train_mod.TrainFlowPolicyWorkspace = object
+        try:
+            # Some training files do "from train import TrainFlowPolicyWorkspace" at import time.
+            # Force that import to resolve to this lightweight shim.
+            sys.modules["train"] = shim_train_mod
+            mod = importlib.import_module(mod_name)
+            cls = getattr(mod, "RealRobotFlowPolicy")
+            return cls, f"{mod_name}.RealRobotFlowPolicy"
+        except Exception as exc:
+            last_exc = exc
+        finally:
+            if prev_train_mod is not None:
+                sys.modules["train"] = prev_train_mod
+            else:
+                cur = sys.modules.get("train", None)
+                if cur is shim_train_mod:
+                    del sys.modules["train"]
+    raise RuntimeError(f"Failed to import RealRobotFlowPolicy from FlowPolicy modules: {last_exc}")
+
+
+def _ensure_flowpolicy_normalizer_aliases(policy) -> None:
+    """
+    Ensure both legacy and dual-view alias keys exist in FlowPolicy normalizer.
+    This prevents key mismatches between checkpoint-normalizer schema and rollout obs keys.
+    """
+    if not hasattr(policy, "normalizer"):
+        return
+    norm = policy.normalizer
+    if not hasattr(norm, "params_dict"):
+        return
+    p = norm.params_dict
+
+    # agentview aliases
+    if "point_cloud" not in p and "agentview_point_cloud" in p:
+        p["point_cloud"] = p["agentview_point_cloud"]
+    if "agentview_point_cloud" not in p and "point_cloud" in p:
+        p["agentview_point_cloud"] = p["point_cloud"]
+
+    # state aliases
+    if "agent_pos" not in p and "state" in p:
+        p["agent_pos"] = p["state"]
+    if "state" not in p and "agent_pos" in p:
+        p["state"] = p["agent_pos"]
+
+
 def _viewer_loop(
     shm_name: str,
     shape: Tuple[int, int, int],
@@ -236,10 +306,10 @@ def _viewer_loop(
 
         shm = _shared_memory.SharedMemory(name=shm_name)
         frame = _np.ndarray(shape, dtype=_np.uint8, buffer=shm.buf)
-        _cv2.namedWindow("DP3 Dual Camera", _cv2.WINDOW_NORMAL)
+        _cv2.namedWindow("CFM Dual Camera", _cv2.WINDOW_NORMAL)
         if hasattr(_cv2, "startWindowThread"):
             _cv2.startWindowThread()
-        _cv2.resizeWindow("DP3 Dual Camera", 720, 300)
+        _cv2.resizeWindow("CFM Dual Camera", 720, 300)
         try:
             status_queue.put_nowait(("ready", os.getpid()))
         except Exception:
@@ -248,7 +318,7 @@ def _viewer_loop(
         while not stop.is_set():
             if ready.wait(0.03):
                 ready.clear()
-                _cv2.imshow("DP3 Dual Camera", frame)
+                _cv2.imshow("CFM Dual Camera", frame)
             key = _cv2.waitKey(1)
             if key >= 0:
                 key = int(key) & 0xFF
@@ -815,7 +885,7 @@ class SpotObservationCollector:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Roll out a trained DP3 policy on Spot with dual cameras."
+        description="Roll out a trained FlowPolicy/CFM policy on Spot with dual cameras."
     )
     parser.add_argument("--ckpt", required=True,
                         help="Path to .ckpt checkpoint file")
@@ -890,6 +960,14 @@ def main() -> None:
         action="store_false",
         help="Use exact per-dimension Student-t fitting (slower; SciPy required).",
     )
+    parser.add_argument(
+        "--policy-log-dir",
+        default=None,
+        help=(
+            "Override policy log_dir from checkpoint config. "
+            "Default: disable training-time policy logging during rollout."
+        ),
+    )
     args = parser.parse_args()
     if args.n_samples < 1:
         raise ValueError(f"--n-samples must be >= 1, got {args.n_samples}")
@@ -903,22 +981,68 @@ def main() -> None:
     from bosdyn.client.frame_helpers import get_a_tform_b, BODY_FRAME_NAME
 
     # -----------------------------------------------------------------------
-    # Load DP3 checkpoint
+    # Load FlowPolicy checkpoint
     # -----------------------------------------------------------------------
     print(f"\n[1/5] Loading checkpoint: {args.ckpt}")
 
-    # Add DP3 source to sys.path for diffusion_policy_3d imports
-    dp3_path = os.path.normpath(os.path.join(_THIS_DIR, "..", "3D-Diffusion-Policy"))
-    if dp3_path not in sys.path:
-        sys.path.insert(0, dp3_path)
+    if _FLOWPOLICY_ROOT not in sys.path:
+        sys.path.insert(0, _FLOWPOLICY_ROOT)
 
     import copy
+
+    # Resolve RealRobotFlowPolicy class used during training.
+    _RealRobotFlowPolicy, policy_target_override = _import_real_robot_flowpolicy()
+    globals()["RealRobotFlowPolicy"] = _RealRobotFlowPolicy
 
     payload = torch.load(open(args.ckpt, "rb"), pickle_module=dill, map_location="cpu")
     cfg = payload["cfg"]
     OmegaConf.set_struct(cfg, False)
 
-    # Instantiate model directly from config (avoids importing train.py / wandb)
+    # Training checkpoints often store __main__.RealRobotFlowPolicy as target.
+    # Remap to importable module path at rollout time.
+    if "policy" in cfg and "_target_" in cfg.policy:
+        tgt = str(cfg.policy._target_)
+        if tgt == "__main__.RealRobotFlowPolicy":
+            cfg.policy._target_ = policy_target_override
+
+    # Training checkpoints often include an absolute policy.log_dir from the
+    # training machine. Disable by default for rollout to avoid permission
+    # errors, or let the user override to a writable path.
+    if "policy" in cfg and "log_dir" in cfg.policy:
+        ckpt_log_dir = cfg.policy.log_dir
+        if args.policy_log_dir:
+            try:
+                override_log_dir = os.path.abspath(os.path.expanduser(args.policy_log_dir))
+                os.makedirs(override_log_dir, exist_ok=True)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to create --policy-log-dir '{args.policy_log_dir}': {exc}"
+                ) from exc
+            cfg.policy.log_dir = override_log_dir
+            print(f"  policy.log_dir   : {override_log_dir} (override)")
+        else:
+            if ckpt_log_dir:
+                print(f"  policy.log_dir   : disabled for rollout (checkpoint has '{ckpt_log_dir}')")
+            cfg.policy.log_dir = None
+
+    # Match the training-time compatibility conversion for dual-view policies:
+    # add FlowPolicyEncoder-required aliases under shape_meta.obs.
+    if "policy" in cfg:
+        policy_shape_meta = None
+        if "shape_meta" in cfg.policy:
+            policy_shape_meta = OmegaConf.to_container(cfg.policy.shape_meta, resolve=True)
+        elif "shape_meta" in cfg:
+            policy_shape_meta = OmegaConf.to_container(cfg.shape_meta, resolve=True)
+        if policy_shape_meta is not None:
+            obs_meta = policy_shape_meta.get("obs", {})
+            if "point_cloud" not in obs_meta and "agentview_point_cloud" in obs_meta:
+                obs_meta["point_cloud"] = {"shape": tuple(obs_meta["agentview_point_cloud"]["shape"])}
+            if "agent_pos" not in obs_meta and "state" in obs_meta:
+                obs_meta["agent_pos"] = {"shape": tuple(obs_meta["state"]["shape"])}
+            policy_shape_meta["obs"] = obs_meta
+            cfg.policy.shape_meta = policy_shape_meta
+
+    # Instantiate model directly from config.
     policy = hydra.utils.instantiate(cfg.policy)
     ema_model = None
     if cfg.training.use_ema:
@@ -926,8 +1050,10 @@ def main() -> None:
 
     # Load saved weights
     policy.load_state_dict(payload["state_dicts"]["model"])
+    _ensure_flowpolicy_normalizer_aliases(policy)
     if ema_model is not None and "ema_model" in payload["state_dicts"]:
         ema_model.load_state_dict(payload["state_dicts"]["ema_model"])
+        _ensure_flowpolicy_normalizer_aliases(ema_model)
 
     if cfg.training.use_ema and ema_model is not None:
         policy = ema_model
@@ -1041,12 +1167,8 @@ def main() -> None:
     dock_requested = bool(args.dock)
     inference_times_ms: List[float] = []
 
-    dp3_path = "/home/akash/UNH/demoGen_research/3D-Diffusion-Policy/3D-Diffusion-Policy"
-    if dp3_path not in sys.path:
-        sys.path.append(dp3_path)
-
-    # Import here so sys.path is already set up regardless of install method
-    from diffusion_policy_3d.common.pytorch_util import dict_apply
+    # Import here so sys.path is already set up regardless of install method.
+    from flow_policy_3d.common.pytorch_util import dict_apply
     st_aggregator: Optional[StudentTActionAggregator] = None
     if args.use_student_t and args.n_samples > 1:
         st_aggregator = StudentTActionAggregator(n_samples=args.n_samples)
@@ -1405,6 +1527,12 @@ def main() -> None:
 
                 obs_dict = dict_apply(obs_dict,
                                       lambda x: x.unsqueeze(0).to(args.device))
+                # FlowPolicy training in this repo uses alias keys:
+                # point_cloud (agentview) and agent_pos (state).
+                if "point_cloud" not in obs_dict and "agentview_point_cloud" in obs_dict:
+                    obs_dict["point_cloud"] = obs_dict["agentview_point_cloud"]
+                if "agent_pos" not in obs_dict and "state" in obs_dict:
+                    obs_dict["agent_pos"] = obs_dict["state"]
 
                 if args.use_student_t and args.n_samples > 1 and st_aggregator is not None:
                     plan, inf_ms, all_samples = multi_sample_inference(
@@ -1566,7 +1694,6 @@ def main() -> None:
         except Exception:
             pass
         print("[rollout] Done.")
-
 
 if __name__ == "__main__":
     main()
